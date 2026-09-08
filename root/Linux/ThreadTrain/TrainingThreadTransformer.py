@@ -24,6 +24,7 @@ from sklearn.metrics import (
     accuracy_score, f1_score,
     average_precision_score, roc_auc_score,
 )
+from sklearn.preprocessing import StandardScaler
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from TratamentoDeDados.temporal_split import (
@@ -127,6 +128,18 @@ def train_one_run(
         weight_decay=train_config['weight_decay'],
     )
 
+    # OneCycleLR (Smith 2018) — warmup linear + cosine annealing.
+    # Ativado por train_config['use_scheduler']; padrão: sem scheduler.
+    scheduler = None
+    if train_config.get('use_scheduler', False):
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=train_config['lr'],
+            total_steps=train_config['n_epochs'] * len(train_loader),
+            pct_start=train_config.get('warmup_pct', 0.1),
+            anneal_strategy='cos',
+        )
+
     n_epochs        = train_config['n_epochs']
     patience        = train_config['patience']
     best_val_loss   = float('inf')
@@ -146,6 +159,8 @@ def train_one_run(
             loss = loss_fn(model(xb), yb)
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()   # OneCycleLR é step-based (por batch)
             train_loss_sum += loss.item() * xb.size(0)
         train_loss = train_loss_sum / len(train_ds)
 
@@ -159,6 +174,7 @@ def train_one_run(
         history.append({
             'epoch': epoch, 'train_loss': train_loss,
             'val_loss': val_loss, 'val_acc': val_acc,
+            'lr': optimizer.param_groups[0]['lr'],
         })
 
         if val_loss < best_val_loss:
@@ -278,12 +294,15 @@ class TrainingThreadTransformer(QThread):
         pos_embed_type='learned',
         batch_size=64, n_epochs=50,
         lr=1e-3, weight_decay=1e-4, patience=10,
+        use_scheduler=False, warmup_pct=0.1,
+        scale_features=True,
     ):
         super().__init__()
-        self.data_set     = data_set
-        self.seeds        = seeds if seeds is not None else DEFAULT_SEEDS
-        self.seq_len      = seq_len
-        self.val_ratio    = val_ratio
+        self.data_set       = data_set
+        self.seeds          = seeds if seeds is not None else DEFAULT_SEEDS
+        self.seq_len        = seq_len
+        self.val_ratio      = val_ratio
+        self.scale_features = scale_features
         self.feature_cols = (feature_cols if feature_cols is not None
                              else list(DEFAULT_TRANSFORMER_FEATURES))
         self.model_config = dict(
@@ -303,6 +322,8 @@ class TrainingThreadTransformer(QThread):
             lr=lr,
             weight_decay=weight_decay,
             patience=patience,
+            use_scheduler=use_scheduler,
+            warmup_pct=warmup_pct,
         )
         self.base_dir   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.output_dir = os.path.join(
@@ -333,11 +354,31 @@ class TrainingThreadTransformer(QThread):
         self._log("\n[1/4] Pre-processamento")
         train_df, test_df = temporal_split(self.data_set, model_name="Transformer-V5")
         class_weights     = analyze_class_distribution(train_df, model_name="Transformer-V5")
-        train_df = add_temporal_features_safe(train_df, is_train=True,  model_name="Transformer-V5")
-        test_df  = add_temporal_features_safe(test_df,  is_train=False, model_name="Transformer-V5")
 
-        train_part, val_part = self._split_train_val(train_df)
+        # Split treino/validação ANTES do feature engineering: rolling/lag
+        # calculados sobre treino+val vazariam para as primeiras linhas da
+        # validação (mesmo anti-padrão corrigido no split treino/teste).
+        train_raw, val_raw = self._split_train_val(train_df)
+
+        train_part = add_temporal_features_safe(train_raw, is_train=True,  model_name="Transformer-V5/train")
+        val_part   = add_temporal_features_safe(val_raw,   is_train=False, model_name="Transformer-V5/val")
+        test_df    = add_temporal_features_safe(test_df,   is_train=False, model_name="Transformer-V5/test")
         self._log(f"Treino: {len(train_part)}  Val: {len(val_part)}  Teste: {len(test_df)}")
+
+        # StandardScaler fit apenas no treino (paridade com TCN_corrigido.py).
+        # Sem isso, features de escalas distintas — Hora (0-23) vs LONGTIME
+        # (z-scored) — entram desbalanceadas na projeção linear de patches.
+        if self.scale_features:
+            scaler = StandardScaler()
+            train_part = train_part.copy()
+            val_part   = val_part.copy()
+            test_df    = test_df.copy()
+            train_part[self.feature_cols] = scaler.fit_transform(train_part[self.feature_cols])
+            val_part[self.feature_cols]   = scaler.transform(val_part[self.feature_cols])
+            test_df[self.feature_cols]    = scaler.transform(test_df[self.feature_cols])
+            self._log(f"StandardScaler aplicado (fit no treino) em {len(self.feature_cols)} features")
+        else:
+            self._log("StandardScaler DESATIVADO (scale_features=False)")
 
         self._log("\n[2/4] Windowing")
         kw = dict(feature_cols=self.feature_cols, seq_len=self.seq_len)
@@ -372,11 +413,13 @@ class TrainingThreadTransformer(QThread):
             runs.append(metrics)
 
             torch.save({
-                'state_dict':   best_state,
-                'model_config': self.model_config,
-                'train_config': self.train_config,
-                'seed':         seed,
-                'metrics':      metrics,
+                'state_dict':     best_state,
+                'model_config':   self.model_config,
+                'train_config':   self.train_config,
+                'feature_cols':   self.feature_cols,
+                'scale_features': self.scale_features,
+                'seed':           seed,
+                'metrics':        metrics,
             }, os.path.join(self.output_dir, f"patchtst_v5_seed{seed}.pt"))
 
             hist_df = pd.DataFrame(history)
